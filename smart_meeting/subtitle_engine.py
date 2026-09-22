@@ -28,6 +28,8 @@ class SubtitleEngine:
     def __init__(self, model_name="base"):
         self.model_name = model_name
         self.lock = threading.Lock()
+        # Separate lock so reading the transcript never waits for Whisper.
+        self.model_lock = threading.Lock()
 
         print(
             f"[Whisper] Loading multilingual model '{model_name}'..."
@@ -321,7 +323,7 @@ class SubtitleEngine:
             return ""
 
         try:
-            with self.lock:
+            with self.model_lock:
                 result = self.model.transcribe(
                     prepared_audio,
 
@@ -333,7 +335,16 @@ class SubtitleEngine:
                     task="translate",
 
                     fp16=False,
-                    temperature=0.0,
+
+                    # A single fixed temperature (0.0 = pure greedy
+                    # decoding) disables Whisper's built-in retry ladder.
+                    # Greedy decoding is the mode most prone to getting
+                    # stuck repeating the same words/phrases. Passing a
+                    # tuple lets Whisper automatically retry at a higher
+                    # temperature (more randomness) whenever the
+                    # greedy pass looks repetitive or low-confidence,
+                    # which is what actually breaks repetition loops.
+                    temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
 
                     condition_on_previous_text=False,
 

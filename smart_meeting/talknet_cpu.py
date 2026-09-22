@@ -62,6 +62,7 @@ from smart_meeting.config import (
     TALKNET_FACE_SIZE,
     MIN_FACE_SIZE,
     DEBUG,
+    TARGET_FPS,
 )
 
 
@@ -963,13 +964,25 @@ class TalkNetASD(nn.Module):
         # MFCC
         # ====================================================
 
+        # IMPORTANT: TalkNet was trained with audio/video alignment
+        # based on the video FPS. The original implementation uses:
+        #   winlen  = 0.025 * 25 / fps
+        #   winstep = 0.010 * 25 / fps
+        #
+        # Our webcam runs at 10 FPS, so using the normal 25 FPS
+        # MFCC settings would make the audio window much shorter
+        # than the 25 visual frames.
+        fps = max(float(TARGET_FPS), 1.0)
+        mfcc_winlen = 0.025 * 25.0 / fps
+        mfcc_winstep = 0.010 * 25.0 / fps
+
         audio_feature = (
             python_speech_features.mfcc(
                 audio,
                 sample_rate,
                 numcep=13,
-                winlen=0.025,
-                winstep=0.010,
+                winlen=mfcc_winlen,
+                winstep=mfcc_winstep,
             )
         ).astype(
             np.float32
@@ -1057,13 +1070,18 @@ class TalkNetASD(nn.Module):
 
             if audio_feature.shape[0] > 0:
 
-                audio_feature = np.pad(
-                    audio_feature,
-                    (
-                        (0, shortage),
-                        (0, 0),
-                    ),
-                    mode="wrap",
+                # Do NOT wrap the beginning of the meeting/audio back
+                # into the end of the current window. That creates an
+                # artificial audio/visual mismatch. Repeat the final
+                # valid MFCC frame only for the tiny amount of padding
+                # required by TalkNet's fixed 4:1 audio/video ratio.
+                last_frame = audio_feature[-1:, :]
+                audio_feature = np.concatenate(
+                    [
+                        audio_feature,
+                        np.repeat(last_frame, shortage, axis=0),
+                    ],
+                    axis=0,
                 )
 
             else:
