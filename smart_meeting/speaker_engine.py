@@ -692,84 +692,119 @@ class SmartMeetingDirector:
                 if box_index in matched_boxes:
                     continue
 
-                # Extra duplicate protection.
-                already_near_track = False
-
-                for track in self.tracks:
-
-                    if compute_iou(track.smooth_box, box) >= 0.20:
-                        already_near_track = True
-                        break
-
-                    distance = center_distance(track.smooth_box, box)
-
-                    if distance <= max(track.size * 0.50, 30.0):
-                        already_near_track = True
-                        break
-
-                if already_near_track:
-                    continue
-
                 crop = self._extract_face_crop(frame_bgr, box)
 
                 # ----------------------------------------------
-                # Same person or new person?
-                #
-                # A visible track that was not matched this frame
-                # (face temporarily missed) is the most likely owner
-                # of a new, unmatched face. Hand the face to it instead
-                # of creating a new ID.
-                #   - Normal mode: only if it is close enough.
-                #   - MAX_PEOPLE cap reached: always (a new face cannot
-                #     be a new person), or ignore it as a false hit.
+                # Step 1: is this box actually the SAME PERSON as
+                # an existing track — matched already this frame,
+                # or not? A loose IoU/center-distance check,
+                # regardless of how long that track has gone
+                # unmatched. This is the key fix: previously a
+                # "near an existing track" box was just DROPPED
+                # (never refreshing that track), so the track kept
+                # aging with a stale position until it exceeded
+                # patience and a brand new ID got created for the
+                # same person. Now it directly refreshes the
+                # closest matching track instead.
                 # ----------------------------------------------
+
+                nearest_index = None
+                nearest_score = -1.0
+
+                for track_index, track in enumerate(self.tracks):
+
+                    iou = compute_iou(track.smooth_box, box)
+
+                    distance = center_distance(track.smooth_box, box)
+
+                    normalized_distance = distance / max(track.size, 1.0)
+
+                    close = (
+                        iou >= 0.20
+                        or distance <= max(track.size * 0.50, 30.0)
+                    )
+
+                    if not close:
+                        continue
+
+                    score = iou - normalized_distance * 0.05
+
+                    if score > nearest_score:
+                        nearest_score = score
+                        nearest_index = track_index
+
+                if nearest_index is not None:
+
+                    if nearest_index in matched_tracks:
+                        # Two detected boxes both landed on a track
+                        # already updated this frame: a genuine
+                        # duplicate detection, not a new person.
+                        continue
+
+                    track = self.tracks[nearest_index]
+
+                    track.smooth_box = list(box)
+
+                    track.update(box, crop, timestamp)
+
+                    matched_tracks.add(nearest_index)
+
+                    matched_boxes.add(box_index)
+
+                    print(
+                        f"[ID] Person {track.id} re-acquired "
+                        "(loose match, same person / face drifted)"
+                    )
+
+                    continue
+
+                # ----------------------------------------------
+                # Step 2: MAX_PEOPLE cap reached and nobody nearby
+                # claimed this box. With a hard cap, a genuinely
+                # new face cannot be a new person -> hand it to
+                # whichever tracked person hasn't been matched yet
+                # this frame (they likely moved further than
+                # expected), or drop it as a false detection if
+                # everyone is already accounted for.
+                # ----------------------------------------------
+
                 capped = bool(MAX_PEOPLE) and len(self.tracks) >= MAX_PEOPLE
 
-                min_missed = 1 if capped else STALE_MIN_MISSED
-
-                stale = [
-                    i for i, t in enumerate(self.tracks)
-                    if i not in matched_tracks
-                    and t.missed_frames >= min_missed
-                ]
-
-                pick = None
-
-                if stale:
-
-                    if capped:
-                        pick = max(
-                            stale,
-                            key=lambda k: self.tracks[k].last_seen,
-                        )
-                    else:
-                        best_d = LOST_MATCH_MAX_DIST
-                        for i in stale:
-                            t = self.tracks[i]
-                            dd = (
-                                center_distance(t.smooth_box, box)
-                                / max(t.size, 1.0)
-                            )
-                            if dd <= best_d:
-                                best_d = dd
-                                pick = i
-
-                if pick is not None:
-                    t = self.tracks[pick]
-                    t.smooth_box = list(box)
-                    t.update(box, crop, timestamp)
-                    matched_tracks.add(pick)
-                    matched_boxes.add(box_index)
-                    print(
-                        f"[ID] Person {t.id} re-acquired "
-                        "(same person, face was briefly lost)"
-                    )
-                    continue
-
                 if capped:
-                    # Cap reached and nobody to hand the face to:
-                    # treat it as a false detection.
+
+                    unmatched_existing = [
+                        i for i in range(len(self.tracks))
+                        if i not in matched_tracks
+                    ]
+
+                    if unmatched_existing:
+
+                        pick = max(
+                            unmatched_existing,
+                            key=lambda i: self.tracks[i].last_seen,
+                        )
+
+                        track = self.tracks[pick]
+
+                        track.smooth_box = list(box)
+
+                        track.update(box, crop, timestamp)
+
+                        matched_tracks.add(pick)
+
+                        matched_boxes.add(box_index)
+
+                        print(
+                            f"[ID] Person {track.id} re-acquired "
+                            "(MAX_PEOPLE cap, same person assumed)"
+                        )
+
                     continue
+
+                # ----------------------------------------------
+                # Step 3: genuinely new face, nowhere near any
+                # existing track -> new (or revived) ID.
+                # ----------------------------------------------
 
                 revived_id = self._recover_lost_id(box, timestamp)
 
@@ -1184,42 +1219,6 @@ class SmartMeetingDirector:
             return self.render_room_overview_frame(
                 frame_bgr,
                 subtitle_text,
-            )
-
-        # ------------------------------------------------
-        # Blur everyone except the active speaker
-        # within this cropped region.
-        # ------------------------------------------------
-
-        with self.lock:
-            other_tracks = [
-                t for t in self.tracks
-                if t.id != active_id
-            ]
-
-        for other_track in other_tracks:
-
-            ox1, oy1, ox2, oy2 = [
-                int(round(v)) for v in other_track.smooth_box
-            ]
-
-            cox1 = max(0, ox1 - x1)
-            coy1 = max(0, oy1 - y1)
-            cox2 = min(crop.shape[1], ox2 - x1)
-            coy2 = min(crop.shape[0], oy2 - y1)
-
-            if cox2 <= cox1 or coy2 <= coy1:
-                continue
-
-            region = crop[coy1:coy2, cox1:cox2]
-
-            if region.size == 0:
-                continue
-
-            crop[coy1:coy2, cox1:cox2] = cv2.GaussianBlur(
-                region,
-                (51, 51),
-                0,
             )
 
         output = cv2.resize(
